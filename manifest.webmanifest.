@@ -1,0 +1,11 @@
+{
+  "name": "Plans au doigt — Débours",
+  "short_name": "Plans Débours",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#10142b",
+  "theme_color": "#10142b",
+  "icons": [
+    { "src": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAFklEQVR4nO3BMQEAAADCoPVPbQhPoAAAAAAAAEkEw3MAAadX3p4AAAAASUVORK5CYII=", "sizes": "128x128", "type": "image/png" }
+  ]
+}
