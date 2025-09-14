@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#10142b">
+<title>Plans au doigt — Débours m²</title>
+<style>
+  :root{--bg:#10142b;--panel:#171d3f;--ink:#eaf0ff;--mut:#9fa9c9;--accent:#79b0ff;--ok:#8fffad;--warn:#ffc074;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;}
+  #app{display:grid;grid-template-rows:auto 1fr auto;height:100vh;}
+  header{display:flex;gap:8px;align-items:center;padding:10px;position:sticky;top:0;background:linear-gradient(#171d3fc0,#171d3f80 60%,transparent);backdrop-filter:saturate(1.2) blur(6px);border-bottom:1px solid #ffffff14}
+  header .tool{flex:1 1 auto;padding:12px;border:1px solid #ffffff17;border-radius:12px;background:#1b2250;color:var(--ink);font-weight:600}
+  header .tool.active{outline:2px solid var(--accent)}
+  header .tool.small{flex:0 0 auto;font-weight:500;padding:10px}
+  #canvasWrap{position:relative;touch-action:none}
+  #canvas{display:block;width:100%;height:100%}
+  #overlay{position:absolute;left:12px;bottom:12px;background:#00000050;padding:8px 10px;border-radius:10px;font-size:12px}
+  #panel{padding:10px;background:#141a3e;border-top:1px solid #ffffff12}
+  .row{display:flex;gap:8px;margin:6px 0}
+  .row>*{flex:1}
+  input,button,select{background:#1b2250;color:var(--ink);border:1px solid #ffffff1a;border-radius:10px;padding:10px}
+  .pill{display:inline-block;background:#1b2250;border:1px solid #ffffff15;border-radius:999px;font-size:12px;padding:4px 8px;margin-right:6px}
+  .card{border:1px solid #ffffff14;background:#12183a;border-radius:12px;padding:8px;margin:6px 0}
+  .mut{color:var(--mut)}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <button class="tool" data-tool="draw">✍️ Dessin</button>
+    <button class="tool" data-tool="scale">📎 Échelle</button>
+    <button class="tool" data-tool="opening">🚪 Ouverture</button>
+    <button class="tool" data-tool="move">🧲 Points</button>
+    <button class="tool small" id="undo">↩️</button>
+    <button class="tool small" id="reset">♻️</button>
+  </header>
+
+  <div id="canvasWrap">
+    <canvas id="canvas"></canvas>
+    <div id="overlay">Prêt.</div>
+  </div>
+
+  <section id="panel">
+    <div class="row">
+      <label class="mut">Unité réelle</label>
+      <select id="unit"><option value="m">m</option><option value="cm">cm</option></select>
+      <label class="mut">Hauteur murs (m)</label>
+      <input id="wallH" type="number" step="0.01" value="2.50">
+    </div>
+    <div class="row">
+      <label class="mut">Ouvertures manuelles (m²)</label>
+      <input id="openManual" type="number" step="0.01" value="0">
+      <button id="exportCsv">⬇️ CSV</button>
+      <button id="exportJson">⬇️ JSON</button>
+    </div>
+    <div id="report"></div>
+    <div style="margin-top:6px">
+      <span class="pill">Sol m²</span>
+      <span class="pill">Plafond m²</span>
+      <span class="pill">Murs m²</span>
+    </div>
+  </section>
+</div>
+
+<script>
+// --- Service worker (PWA offline) ---
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js'));
+}
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const tools = [...document.querySelectorAll('header .tool')];
+const unitSel = document.getElementById('unit');
+const wallHInput = document.getElementById('wallH');
+const openManualInput = document.getElementById('openManual');
+const exportCsvBtn = document.getElementById('exportCsv');
+const exportJsonBtn = document.getElementById('exportJson');
+const undoBtn = document.getElementById('undo');
+const resetBtn = document.getElementById('reset');
+const reportEl = document.getElementById('report');
+
+let tool = 'draw';
+function setTool(t){ tool=t; tools.forEach(b=>b.classList.toggle('active', b.dataset.tool===t)); msg(`Outil: ${t}`) }
+tools.filter(b=>b.dataset.tool).forEach(b=>b.addEventListener('click',()=>setTool(b.dataset.tool)));
+undoBtn.onclick = ()=> undo();
+resetBtn.onclick = ()=> resetAll();
+
+function msg(t){ overlay.textContent = t }
+
+// State
+let view = {x:0,y:0,zoom:1};
+let scale = null; // {a:{x,y},b:{x,y},meters}
+let rooms = [];   // {id, pts:[{x,y}], height, openings:[], openManual}
+let nextId = 1;
+let drawing = null; // freehand or scale/open line
+let history = [];
+
+function pushHistory(){ history.push(JSON.stringify({view, scale, rooms})); if(history.length>50) history.shift() }
+function undo(){ if(!history.length) return; const s=JSON.parse(history.pop()); view=s.view; scale=s.scale; rooms=s.rooms; draw(); refresh() }
+
+function resetAll(){ pushHistory(); view={x:0,y:0,zoom:1}; scale=null; rooms=[]; nextId=1; draw(); refresh(); msg('Projet réinitialisé') }
+
+function resize(){ canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight; draw() }
+new ResizeObserver(resize).observe(document.getElementById('canvasWrap'));
+
+const scr2w = p => ({x:(p.x-view.x)/view.zoom, y:(p.y-view.y)/view.zoom});
+const w2scr = p => ({x:p.x*view.zoom+view.x, y:p.y*view.zoom+view.y});
+const dist = (p,q)=> Math.hypot(p.x-q.x,p.y-q.y);
+
+function pxToM(px){
+  if(!scale) return null;
+  const pxLen = dist(scale.a, scale.b);
+  const mPerPx = scale.meters/pxLen;
+  return px*mPerPx;
+}
+
+function polygonArea(pts){
+  let s=0; for(let i=0;i<pts.length;i++){const j=(i+1)%pts.length; s+=pts[i].x*pts[j].y-pts[j].x*pts[i].y} return Math.abs(s/2)
+}
+function polygonPerimeter(pts){
+  let p=0; for(let i=0;i<pts.length;i++){const j=(i+1)%pts.length; p+=dist(pts[i],pts[j])} return p
+}
+
+// Douglas-Peucker simplification
+function simplify(points, tolPx=2){
+  if(points.length<3) return points.slice();
+  const sqTol = tolPx*tolPx;
+  function sqSegDist(p,a,b){
+    let x=a.x, y=a.y; let dx=b.x-x, dy=b.y-y;
+    if(dx||dy){ const t=((p.x-x)*dx+(p.y-y)*dy)/(dx*dx+dy*dy); if(t>1){x=b.x;y=b.y}else if(t>0){x+=dx*t;y+=dy*t} }
+    dx=p.x-x; dy=p.y-y; return dx*dx+dy*dy;
+  }
+  function simplifyDP(points, first, last, sqTol, out){
+    let maxSq= sqTol, index= -1;
+    for(let i=first+1;i<last;i++){ const sqd = sqSegDist(points[i], points[first], points[last]); if(sqd>maxSq){ index=i; maxSq=sqd } }
+    if(maxSq>sqTol){
+      if(index-first>1) simplifyDP(points, first, index, sqTol, out);
+      out.push(points[index]);
+      if(last-index>1) simplifyDP(points, index, last, sqTol, out);
+    }
+  }
+  const out=[points[0]];
+  simplifyDP(points,0,points.length-1,sqTol,out);
+  out.push(points[points.length-1]);
+  return out;
+}
+
+// Touch handling (freehand + pinch zoom)
+let touches = new Map();
+canvas.addEventListener('touchstart', e=>{
+  e.preventDefault();
+  if(e.touches.length===2){ // start pinch
+    touches.set(e.touches[0].identifier, {x:e.touches[0].clientX,y:e.touches[0].clientY});
+    touches.set(e.touches[1].identifier, {x:e.touches[1].clientX,y:e.touches[1].clientY});
+    drawing=null; return;
+  }
+  const t = e.touches[0];
+  const p = scr2w({x:t.clientX - canvas.getBoundingClientRect().left, y:t.clientY - canvas.getBoundingClientRect().top});
+  if(tool==='draw'){
+    pushHistory();
+    drawing = {kind:'free', pts:[p]};
+  } else if(tool==='scale'){
+    pushHistory();
+    drawing = {kind:'scale', a:p, b:p};
+  } else if(tool==='opening'){
+    pushHistory();
+    drawing = {kind:'open', a:p, b:p};
+  } else if(tool==='move'){
+    // attraper le vertex le plus proche
+    let best=null, bestD=12/view.zoom;
+    rooms.forEach(r=>r.pts.forEach(pt=>{const d=dist(pt,p); if(d<bestD){best=pt; bestD=d}}));
+    if(best) drawing = {kind:'move', point:best};
+  }
+});
+canvas.addEventListener('touchmove', e=>{
+  e.preventDefault();
+  if(e.touches.length===2){
+    // pinch zoom
+    const r = canvas.getBoundingClientRect();
+    const p1 = {x:e.touches[0].clientX, y:e.touches[0].clientY};
+    const p2 = {x:e.touches[1].clientX, y:e.touches[1].clientY};
+    const c = {x:(p1.x+p2.x)/2 - r.left, y:(p1.y+p2.y)/2 - r.top};
+    const prev1 = touches.get(e.touches[0].identifier) || p1;
+    const prev2 = touches.get(e.touches[1].identifier) || p2;
+    const prevDist = Math.hypot(prev1.x-prev2.x, prev1.y-prev2.y);
+    const curDist = Math.hypot(p1.x-p2.x, p1.y-p2.y);
+    const factor = curDist && prevDist ? curDist/prevDist : 1;
+    const worldC = scr2w({x:c.x,y:c.y});
+    view.zoom = Math.max(0.2, Math.min(5, view.zoom*factor));
+    const after = w2scr(worldC);
+    view.x += c.x - after.x;
+    view.y += c.y - after.y;
+    touches.set(e.touches[0].identifier, p1);
+    touches.set(e.touches[1].identifier, p2);
+    draw();
+    return;
+  }
+  const t = e.touches[0];
+  const p = scr2w({x:t.clientX - canvas.getBoundingClientRect().left, y:t.clientY - canvas.getBoundingClientRect().top});
+  if(!drawing) return;
+  if(drawing.kind==='free'){
+    drawing.pts.push(p); drawFreePreview();
+  } else if(drawing.kind==='scale' || drawing.kind==='open'){
+    drawing.b = p; draw();
+  } else if(drawing.kind==='move'){
+    drawing.point.x = p.x; drawing.point.y = p.y; draw(); refresh();
+  }
+});
+canvas.addEventListener('touchend', e=>{
+  e.preventDefault();
+  if(drawing && drawing.kind==='free'){
+    // close + simplify + add room
+    const pts = drawing.pts;
+    if(pts.length>3){
+      // fermer si extrémités proches
+      if(dist(pts[0], pts[pts.length-1]) < 16/view.zoom) pts[pts.length-1] = pts[0];
+      const simp = simplify(pts, 3/view.zoom);
+      const closed = (simp[0].x===simp[simp.length-1].x && simp[0].y===simp[simp.length-1].y) ? simp.slice(0,-1) : simp;
+      rooms.push({id:nextId++, pts:closed, height:parseFloat(wallHInput.value||'2.5'), openings:[], openManual:parseFloat(openManualInput.value||'0')});
+      openManualInput.value = '0';
+      drawing=null; draw(); refresh(); msg('Pièce ajoutée');
+    } else { drawing=null; draw() }
+  } else if(drawing && drawing.kind==='scale'){
+    const meters = parseFloat(prompt('Longueur réelle (m) ?', '1')||'1');
+    if(meters>0 && dist(drawing.a, drawing.b)>0) { scale = {a:drawing.a, b:drawing.b, meters}; msg('Échelle définie') }
+    drawing=null; draw(); refresh();
+  } else if(drawing && drawing.kind==='open'){
+    const width_m = pxToM(dist(drawing.a, drawing.b)) || 0;
+    const height_m = parseFloat(prompt('Hauteur ouverture (m) ?', '2.1')||'0');
+    const area = Math.max(0, width_m * height_m);
+    if(area>0 && rooms.length){
+      // rattacher à la pièce la plus proche du milieu
+      const mid = {x:(drawing.a.x+drawing.b.x)/2, y:(drawing.a.y+drawing.b.y)/2};
+      const target = rooms.slice().sort((r1,r2)=>{
+        const c1=centroid(r1.pts), c2=centroid(r2.pts);
+        return Math.hypot(c1.x-mid.x,c1.y-mid.y) - Math.hypot(c2.x-mid.x,c2.y-mid.y);
+      })[0];
+      target.openings.push({a:drawing.a, b:drawing.b, width_m, height_m, area});
+      msg('Ouverture ajoutée');
+    }
+    drawing=null; draw(); refresh();
+  } else if(drawing && drawing.kind==='move'){
+    drawing=null; draw(); refresh();
+  }
+});
+
+function centroid(pts){ let x=0,y=0; pts.forEach(p=>{x+=p.x;y+=p.y}); return {x:x/pts.length,y:y/pts.length} }
+
+function drawGrid(){
+  ctx.save();
+  ctx.translate(view.x, view.y); ctx.scale(view.zoom, view.zoom);
+  const step = 32;
+  const w = canvas.width/view.zoom, h = canvas.height/view.zoom;
+  const x0 = -view.x/view.zoom, y0 = -view.y/view.zoom;
+  ctx.strokeStyle = 'rgba(255,255,255,.05)'; ctx.lineWidth = 1/view.zoom;
+  ctx.beginPath();
+  for(let x=Math.floor(-x0/step)*step; x<(-x0+w)+step; x+=step){ ctx.moveTo(x,-y0); ctx.lineTo(x,-y0+h) }
+  for(let y=Math.floor(-y0/step)*step; y<(-y0+h)+step; y+=step){ ctx.moveTo(-x0,y); ctx.lineTo(-x0+w,y) }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawFreePreview(){
+  draw();
+  if(drawing && drawing.kind==='free'){
+    ctx.save(); ctx.translate(view.x,view.y); ctx.scale(view.zoom,view.zoom);
+    ctx.beginPath(); drawing.pts.forEach((p,i)=> i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));
+    ctx.strokeStyle='#fff'; ctx.setLineDash([6/view.zoom,6/view.zoom]); ctx.lineWidth=1/view.zoom; ctx.stroke(); ctx.setLineDash([]);
+    ctx.restore();
+  }
+}
+
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  drawGrid();
+
+  ctx.save(); ctx.translate(view.x,view.y); ctx.scale(view.zoom,view.zoom);
+
+  // scale line
+  if(scale){
+    ctx.beginPath(); ctx.moveTo(scale.a.x,scale.a.y); ctx.lineTo(scale.b.x,scale.b.y);
+    ctx.strokeStyle='orange'; ctx.lineWidth=2/view.zoom; ctx.stroke();
+    const mid={x:(scale.a.x+scale.b.x)/2,y:(scale.a.y+scale.b.y)/2};
+    ctx.fillStyle='orange'; ctx.font=`${12/view.zoom}px ui-monospace`;
+    ctx.fillText(`${scale.meters.toFixed(3)} m`, mid.x+6/view.zoom, mid.y-6/view.zoom);
+  }
+
+  // rooms
+  rooms.forEach(r=>{
+    ctx.beginPath(); r.pts.forEach((p,i)=> i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.closePath();
+    ctx.fillStyle='rgba(121,176,255,.12)'; ctx.strokeStyle='rgba(121,176,255,.9)'; ctx.lineWidth=1/view.zoom; ctx.fill(); ctx.stroke();
+    r.pts.forEach(p=>{ ctx.beginPath(); ctx.arc(p.x,p.y,4/view.zoom,0,Math.PI*2); ctx.fillStyle='rgba(143,255,173,.95)'; ctx.fill() });
+    const c=centroid(r.pts); ctx.fillStyle='#eaf0ff'; ctx.font=`${12/view.zoom}px ui-monospace`; ctx.fillText(`Pièce ${r.id}`, c.x+6/view.zoom, c.y-6/view.zoom);
+
+    // openings
+    r.openings.forEach(o=>{
+      ctx.beginPath(); ctx.moveTo(o.a.x,o.a.y); ctx.lineTo(o.b.x,o.b.y); ctx.strokeStyle='#ffc074'; ctx.lineWidth=2/view.zoom; ctx.stroke();
+      const mid={x:(o.a.x+o.b.x)/2,y:(o.a.y+o.b.y)/2}; ctx.fillStyle='#ffc074'; ctx.font=`${11/view.zoom}px ui-monospace`;
+      ctx.fillText(`${(o.width_m||0).toFixed(2)}×${(o.height_m||0).toFixed(2)} m`, mid.x+6/view.zoom, mid.y-6/view.zoom);
+    });
+  });
+
+  // temp line
+  if(drawing && (drawing.kind==='scale' || drawing.kind==='open')){
+    ctx.beginPath(); ctx.moveTo(drawing.a.x,drawing.a.y); ctx.lineTo(drawing.b.x,drawing.b.y);
+    ctx.strokeStyle= drawing.kind==='scale' ? 'orange' : '#fff'; ctx.setLineDash([6/view.zoom,6/view.zoom]); ctx.lineWidth=1/view.zoom; ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  ctx.restore();
+}
+
+function refresh(){
+  // compute report
+  const rows = rooms.map(r=>{
+    const area_px2 = polygonArea(r.pts);
+    const per_px   = polygonPerimeter(r.pts);
+    const openings = (r.openings?.reduce((s,o)=>s+(o.area||0),0)||0) + (r.openManual||0);
+    let floor=null, ceil=null, wall=null;
+    if(scale){
+      const m2_per_px2 = Math.pow(pxToM(1),2);
+      const per_m = pxToM(per_px);
+      floor = area_px2 * m2_per_px2;
+      ceil  = floor;
+      wall  = Math.max(0, per_m*(r.height||2.5) - openings);
+    }
+    return {id:r.id, floor, ceil, wall, openings, height:r.height};
+  });
+
+  reportEl.innerHTML = rows.length? rows.map(row=>{
+    const f = v=> v==null ? '<span class="mut">— échelle ?</span>' : v.toFixed(3)+' m²';
+    return `<div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <strong>Pièce ${row.id}</strong>
+        <span class="mut">H murs: ${row.height.toFixed(2)} m • Ouvertures: ${row.openings.toFixed(3)} m²</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:6px">
+        <div>Sol: <strong>${f(row.floor)}</strong></div>
+        <div>Plafond: <strong>${f(row.ceil)}</strong></div>
+        <div>Murs: <strong>${f(row.wall)}</strong></div>
+      </div>
+    </div>`;
+  }).join('') : '<div class="mut">Aucune pièce. Dessine au doigt avec ✍️, puis définis l’échelle.</div>';
+}
+
+exportCsvBtn.onclick = ()=>{
+  const lines=[['Piece','Hauteur_murs_m','Ouvertures_m2','Surface_sol_m2','Surface_plafond_m2','Surface_murs_m2']];
+  rooms.forEach(r=>{
+    const area_px2=polygonArea(r.pts); const per_px=polygonPerimeter(r.pts);
+    const openings=(r.openings?.reduce((s,o)=>s+(o.area||0),0)||0)+(r.openManual||0);
+    let floor='', ceil='', wall='';
+    if(scale){
+      const m2_per_px2=Math.pow(pxToM(1),2);
+      const per_m=pxToM(per_px);
+      floor=(area_px2*m2_per_px2).toFixed(3);
+      ceil=floor;
+      wall=Math.max(0, per_m*(r.height||2.5)-openings).toFixed(3);
+    }
+    lines.push([`Piece ${r.id}`,(r.height||0).toFixed(3), openings.toFixed(3), floor, ceil, wall]);
+  });
+  download('debours.csv', lines.map(l=>l.join(',')).join('\n'), 'text/csv');
+}
+exportJsonBtn.onclick = ()=>{
+  const payload={rooms, scale};
+  download('projet.json', JSON.stringify(payload,null,2), 'application/json');
+}
+
+function download(name, content, mime){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([content],{type:mime}));
+  a.download=name; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+}
+
+// H changes for new drawings
+wallHInput.addEventListener('change', ()=> msg('Nouvelle hauteur appliquée aux prochaines pièces'));
+openManualInput.addEventListener('change', ()=> msg('Ouvertures manuelles affectées à la prochaine pièce'));
+
+resize(); draw(); refresh();
+setTool('draw');
+msg('✍️ Dessine au doigt. Pince pour zoomer. Mets une échelle 📎 pour les m².');
+
+</script>
+</body>
+</html>
